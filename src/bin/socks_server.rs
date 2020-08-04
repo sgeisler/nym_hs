@@ -1,52 +1,20 @@
 #![feature(async_closure)]
 
 use crate::SocksError::ProtocolError;
-use futures::io::Error;
-use futures::{FutureExt, SinkExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
+use nym_hs::*;
 use rand::Rng;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
 use structopt::StructOpt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::RwLock;
-use tokio::time::Duration;
 use tokio_tungstenite::connect_async;
 use tungstenite::Message;
-
-// how long to wait for acks before resending in ms
-const TIMEOUT: u64 = 3000;
-
-type ConnectionId = [u8; 32];
-/// Maps connection id to a socket reachable through a channel
-type Connections = Arc<RwLock<HashMap<ConnectionId, Sender<Payload>>>>;
 
 #[derive(StructOpt)]
 struct Options {
     websocket: String,
-}
-
-#[derive(Deserialize, Serialize, Clone)]
-struct Packet {
-    recipient: Identity,
-    stream: ConnectionId,
-    payload: Payload,
-}
-
-#[derive(Deserialize, Serialize, Clone)]
-enum Payload {
-    Establish { sender: Identity },
-    Data { idx: usize, data: Vec<u8> },
-    Ack { idx: usize },
-}
-
-#[derive(Deserialize, Serialize, Default, Copy, Clone)]
-struct Identity {
-    client: [u8; 32],
-    gateway: [u8; 32],
 }
 
 #[tokio::main]
@@ -74,10 +42,10 @@ async fn main() {
 async fn handle_connection(
     mut socket: TcpStream,
     connections: Connections,
-    mut out: Sender<Packet>,
+    out: Sender<Packet>,
 ) -> Result<(), SocksError> {
     let id: ConnectionId = rand::thread_rng().gen();
-    let (in_sender, mut incoming) = tokio::sync::mpsc::channel(16);
+    let (in_sender, incoming) = tokio::sync::mpsc::channel(16);
     connections.write().await.insert(id, in_sender);
 
     authenticate(&mut socket).await?;
@@ -99,80 +67,7 @@ async fn handle_connection(
         .gateway
         .copy_from_slice(&bs58::decode(gateway).into_vec().unwrap());
 
-    let mut buffer = [0u8; 500];
-    let mut last_out_msg_id = 0;
-    let mut last_in_msg_id = 0;
-    let mut unack_msg = Some(Packet {
-        recipient,
-        stream: id,
-        payload: Payload::Establish {
-            sender: Default::default(),
-        },
-    });
-    let mut resend_interval = tokio::time::interval(Duration::from_millis(TIMEOUT));
-
-    loop {
-        select! {
-            read = socket.read(&mut buffer), if unack_msg.is_none() => {
-                last_out_msg_id += 1;
-                let packet = Packet {
-                    recipient,
-                    stream: id,
-                    payload: Payload::Data {
-                        idx: last_out_msg_id,
-                        data: buffer[..read.unwrap()].into()
-                    },
-                };
-                unack_msg = Some(packet.clone());
-                out.send(packet).await;
-            },
-            payload = incoming.next() => {
-                match payload.unwrap() {
-                    Payload::Data {idx, data} => {
-                        let expected_msg_id = last_in_msg_id + 1;
-                        match idx {
-                            last_in_msg_id => {
-                                // resend lost ACK
-                                out.send(Packet {
-                                    recipient,
-                                    stream: id,
-                                    payload: Payload::Ack {
-                                        idx
-                                    }
-                                }).await;
-                            },
-                            expected_msg_id => {
-                                // accept data and send ACK
-                                socket.write_all(&data).await.unwrap();
-                                last_in_msg_id = idx;
-                                out.send(Packet {
-                                    recipient,
-                                    stream: id,
-                                    payload: Payload::Ack {
-                                        idx
-                                    }
-                                }).await;
-                            },
-                            _ => panic!("invalid state"),
-                        }
-                    },
-                    Payload::Ack { idx } => {
-                        if idx == last_out_msg_id {
-                            unack_msg = None;
-                        } else {
-                            eprintln!("Late ACK {}", idx);
-                        }
-                    },
-                    Payload::Establish {..} => panic!("Unexpected establish message"),
-                }
-            },
-            _ = resend_interval.tick() => {
-                if let Some(packet) = unack_msg.clone() {
-                    out.send(packet).await;
-                }
-            }
-        }
-    }
+    reliable_transport(recipient, id, socket, out, incoming).await
 }
 
 async fn nym_client(connections: Connections, mut outgoing: Receiver<Packet>) {
@@ -265,12 +160,6 @@ struct SocksRequest {
     port: u16,
 }
 
-#[derive(Debug)]
-enum SocksError {
-    IoError(tokio::io::Error),
-    ProtocolError(&'static str),
-}
-
 async fn authenticate(socket: &mut TcpStream) -> Result<(), SocksError> {
     if socket.read_u8().await? != 5 {
         return Err(ProtocolError("Wrong version"));
@@ -328,10 +217,4 @@ async fn receive_request(socket: &mut TcpStream) -> Result<SocksRequest, SocksEr
         .await?;
 
     Ok(SocksRequest { fqdn: addr, port })
-}
-
-impl From<tokio::io::Error> for SocksError {
-    fn from(e: tokio::io::Error) -> Self {
-        SocksError::IoError(e)
-    }
 }
