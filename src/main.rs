@@ -2,26 +2,261 @@
 
 use crate::SocksError::ProtocolError;
 use futures::io::Error;
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, SinkExt, StreamExt, TryStreamExt};
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use structopt::StructOpt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
+use tokio::select;
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::RwLock;
+use tokio::time::Duration;
+use tokio_tungstenite::connect_async;
+use tungstenite::Message;
+
+// how long to wait for acks before resending in ms
+const TIMEOUT: u64 = 3000;
+
+type ConnectionId = [u8; 32];
+/// Maps connection id to a socket reachable through a channel
+type Connections = Arc<RwLock<HashMap<ConnectionId, Sender<Payload>>>>;
+
+#[derive(StructOpt)]
+struct Options {
+    websocket: String,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+struct Packet {
+    recipient: Identity,
+    stream: ConnectionId,
+    payload: Payload,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+enum Payload {
+    Establish { sender: Identity },
+    Data { idx: usize, data: Vec<u8> },
+    Ack { idx: usize },
+}
+
+#[derive(Deserialize, Serialize, Default, Copy, Clone)]
+struct Identity {
+    client: [u8; 32],
+    gateway: [u8; 32],
+}
 
 #[tokio::main]
 async fn main() {
+    let connections: Connections = Default::default();
+    let (out_sender, out_receiver) = tokio::sync::mpsc::channel(16);
+
+    tokio::spawn(nym_client(connections.clone(), out_receiver));
+
     TcpListener::bind("127.0.0.1:9090")
         .await
         .unwrap()
         .incoming()
-        .for_each(|socket| tokio::spawn(handle_connection(socket.unwrap())).map(|_| ()))
+        .for_each(|socket| {
+            tokio::spawn(handle_connection(
+                socket.unwrap(),
+                connections.clone(),
+                out_sender.clone(),
+            ))
+            .map(|_| ())
+        })
         .await;
 }
 
-async fn handle_connection(mut socket: TcpStream) -> Result<(), SocksError> {
+async fn handle_connection(
+    mut socket: TcpStream,
+    connections: Connections,
+    mut out: Sender<Packet>,
+) -> Result<(), SocksError> {
+    let id: ConnectionId = rand::thread_rng().gen();
+    let (in_sender, mut incoming) = tokio::sync::mpsc::channel(16);
+    connections.write().await.insert(id, in_sender);
+
     authenticate(&mut socket).await?;
     let req = receive_request(&mut socket).await?;
     println!("{:?}", req);
 
-    Ok(())
+    // parse <nym_id>.nym TLDs
+    let mut fqdn = req.fqdn.split('.');
+    let peer = fqdn.next().unwrap();
+    let gateway = fqdn.next().unwrap();
+    assert_eq!("nym", fqdn.next().unwrap());
+    assert_eq!(None, fqdn.next());
+
+    let mut recipient = Identity::default();
+    recipient
+        .client
+        .copy_from_slice(&bs58::decode(peer).into_vec().unwrap());
+    recipient
+        .gateway
+        .copy_from_slice(&bs58::decode(gateway).into_vec().unwrap());
+
+    let mut buffer = [0u8; 500];
+    let mut last_out_msg_id = 0;
+    let mut last_in_msg_id = 0;
+    let mut unack_msg = Some(Packet {
+        recipient,
+        stream: id,
+        payload: Payload::Establish {
+            sender: Default::default(),
+        },
+    });
+    let mut resend_interval = tokio::time::interval(Duration::from_millis(TIMEOUT));
+
+    loop {
+        select! {
+            read = socket.read(&mut buffer), if unack_msg.is_none() => {
+                last_out_msg_id += 1;
+                let packet = Packet {
+                    recipient,
+                    stream: id,
+                    payload: Payload::Data {
+                        idx: last_out_msg_id,
+                        data: buffer[..read.unwrap()].into()
+                    },
+                };
+                unack_msg = Some(packet.clone());
+                out.send(packet).await;
+            },
+            payload = incoming.next() => {
+                match payload.unwrap() {
+                    Payload::Data {idx, data} => {
+                        let expected_msg_id = last_in_msg_id + 1;
+                        match idx {
+                            last_in_msg_id => {
+                                // resend lost ACK
+                                out.send(Packet {
+                                    recipient,
+                                    stream: id,
+                                    payload: Payload::Ack {
+                                        idx
+                                    }
+                                }).await;
+                            },
+                            expected_msg_id => {
+                                // accept data and send ACK
+                                socket.write_all(&data).await.unwrap();
+                                last_in_msg_id = idx;
+                                out.send(Packet {
+                                    recipient,
+                                    stream: id,
+                                    payload: Payload::Ack {
+                                        idx
+                                    }
+                                }).await;
+                            },
+                            _ => panic!("invalid state"),
+                        }
+                    },
+                    Payload::Ack { idx } => {
+                        if idx == last_out_msg_id {
+                            unack_msg = None;
+                        } else {
+                            eprintln!("Late ACK {}", idx);
+                        }
+                    },
+                    Payload::Establish {..} => panic!("Unexpected establish message"),
+                }
+            },
+            _ = resend_interval.tick() => {
+                if let Some(packet) = unack_msg.clone() {
+                    out.send(packet).await;
+                }
+            }
+        }
+    }
+}
+
+async fn nym_client(connections: Connections, mut outgoing: Receiver<Packet>) {
+    let options: Options = Options::from_args();
+
+    let (mut ws, _) = connect_async(&options.websocket)
+        .await
+        .expect("Couldn't connect to nym websocket");
+
+    ws.send(Message::text("{\"type\": \"selfAddress\"}"))
+        .await
+        .unwrap();
+
+    let addr_answer = serde_json::from_str::<serde_json::Value>(&message_to_string(
+        ws.next().await.unwrap().unwrap(),
+    ))
+    .unwrap();
+    let addr = addr_answer.get("address").unwrap().as_str().unwrap();
+    let mut addr_parts = addr.split('@');
+    let node = bs58::decode(&addr_parts.next().unwrap())
+        .into_vec()
+        .unwrap();
+    let gateway = bs58::decode(&addr_parts.next().unwrap())
+        .into_vec()
+        .unwrap();
+
+    let mut us = Identity::default();
+    us.client.copy_from_slice(&node);
+    us.gateway.copy_from_slice(&gateway);
+
+    loop {
+        select! {
+            Some(packet) = outgoing.next() => {
+                let mut packet = packet;
+
+                if let Payload::Establish { ref mut sender } = packet.payload {
+                    *sender = us;
+                }
+
+                let bytes = bincode::serialize(&packet).unwrap();
+                ws.send(Message::Binary(bytes)).await.unwrap();
+                // receive send ack
+                ws.next().await.unwrap().unwrap();
+            },
+            Some(Ok(message)) = ws.next() => {
+                let (stream, payload) = message_to_stream_payload(message);
+                connections.write()
+                    .await
+                    .get_mut(&stream)
+                    .unwrap()
+                    .send(payload)
+                    .await
+                    .map_err(|_| "send_err")
+                    .unwrap();
+            }
+        }
+    }
+}
+
+fn message_to_string(msg: Message) -> String {
+    match msg {
+        Message::Text(command) => command,
+        Message::Binary(bin) => String::from_utf8(bin).unwrap(),
+        Message::Close(_) => {
+            panic!("Connection closed");
+        }
+        msg => {
+            panic!("Received unsupported message: {:?}", msg);
+        }
+    }
+}
+
+fn message_to_stream_payload(msg: Message) -> (ConnectionId, Payload) {
+    let bytes = match msg {
+        Message::Binary(bin) => bin,
+        _ => panic!("Unexpected msg type"),
+    };
+
+    let mut id = ConnectionId::default();
+    id.copy_from_slice(&bytes[0..32]);
+
+    let payload = bincode::deserialize::<Payload>(&bytes[32..]).unwrap();
+
+    (id, payload)
 }
 
 #[derive(Debug)]
