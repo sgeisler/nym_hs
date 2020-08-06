@@ -127,33 +127,6 @@ async fn nym_client(connections: Connections, mut outgoing: Receiver<Packet>) {
     }
 }
 
-fn message_to_string(msg: Message) -> String {
-    match msg {
-        Message::Text(command) => command,
-        Message::Binary(bin) => String::from_utf8(bin).unwrap(),
-        Message::Close(_) => {
-            panic!("Connection closed");
-        }
-        msg => {
-            panic!("Received unsupported message: {:?}", msg);
-        }
-    }
-}
-
-fn message_to_stream_payload(msg: Message) -> (ConnectionId, Payload) {
-    let bytes = match msg {
-        Message::Binary(bin) => bin,
-        _ => panic!("Unexpected msg type"),
-    };
-
-    let mut id = ConnectionId::default();
-    id.copy_from_slice(&bytes[0..32]);
-
-    let payload = bincode::deserialize::<Payload>(&bytes[32..]).unwrap();
-
-    (id, payload)
-}
-
 #[derive(Debug)]
 struct SocksRequest {
     fqdn: String,

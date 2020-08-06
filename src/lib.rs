@@ -8,6 +8,7 @@ use tokio::stream::StreamExt;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::RwLock;
 use tokio::time::Duration;
+use tungstenite::Message;
 
 // how long to wait for acks before resending in ms
 pub const TIMEOUT: u64 = 3000;
@@ -73,8 +74,8 @@ pub async fn reliable_transport(
                     .map_err(|_| "send_error")
                     .unwrap();
             },
-            payload = ingress.next() => {
-                match payload.unwrap() {
+            Some(payload) = ingress.next() => {
+                match payload {
                     Payload::Data {idx, data} => {
                         if last_in_msg_id == idx {
                             // resend lost ACK
@@ -113,7 +114,18 @@ pub async fn reliable_transport(
                             eprintln!("Late ACK {}", idx);
                         }
                     },
-                    Payload::Establish {..} => panic!("Unexpected establish message"),
+                    Payload::Establish {..} => {
+                        egress.send(Packet {
+                                recipient: peer,
+                                stream: stream_id,
+                                payload: Payload::Ack {
+                                    idx: 0
+                                }
+                            })
+                                .await
+                                .map_err(|_| "send_error")
+                                .unwrap();
+                    },
                 }
             },
             _ = resend_interval.tick() => {
@@ -126,6 +138,33 @@ pub async fn reliable_transport(
             }
         }
     }
+}
+
+pub fn message_to_string(msg: Message) -> String {
+    match msg {
+        Message::Text(command) => command,
+        Message::Binary(bin) => String::from_utf8(bin).unwrap(),
+        Message::Close(_) => {
+            panic!("Connection closed");
+        }
+        msg => {
+            panic!("Received unsupported message: {:?}", msg);
+        }
+    }
+}
+
+pub fn message_to_stream_payload(msg: Message) -> (ConnectionId, Payload) {
+    let bytes = match msg {
+        Message::Binary(bin) => bin,
+        _ => panic!("Unexpected msg type"),
+    };
+
+    let mut id = ConnectionId::default();
+    id.copy_from_slice(&bytes[0..32]);
+
+    let payload = bincode::deserialize::<Payload>(&bytes[32..]).unwrap();
+
+    (id, payload)
 }
 
 #[derive(Debug)]
