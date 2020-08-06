@@ -175,6 +175,7 @@ pub fn message_to_stream_payload(msg: Message) -> (ConnectionId, Payload) {
 
 #[derive(Debug)]
 pub enum SocksError {
+    UnsupportedDestination,
     IoError(tokio::io::Error),
     ProtocolError(&'static str),
 }

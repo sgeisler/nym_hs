@@ -63,6 +63,7 @@ async fn main() {
                 let (stream, payload) = message_to_stream_payload(message);
                 match payload {
                     Payload::Establish { sender } => {
+                    // FIXME: turn match/if around
                         if let Some(conn) = connections.get_mut(&stream) {
                             conn.send(Payload::Establish { sender }).await.unwrap();
                         } else {
