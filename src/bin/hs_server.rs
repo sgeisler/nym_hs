@@ -18,6 +18,8 @@ struct Options {
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt::init();
+
     let options: Options = Options::from_args();
 
     let (mut ws, _) = connect_async(&options.websocket)
@@ -46,7 +48,7 @@ async fn main() {
     us.client.copy_from_slice(&node);
     us.gateway.copy_from_slice(&gateway);
 
-    let (out_send, mut out_rec) = tokio::sync::mpsc::channel(16);
+    let (mut out_send, mut out_rec) = tokio::sync::mpsc::channel(16);
     let mut connections = HashMap::<ConnectionId, Sender<Payload>>::new();
 
     loop {
@@ -61,18 +63,31 @@ async fn main() {
                 let (stream, payload) = message_to_stream_payload(message);
                 match payload {
                     Payload::Establish { sender } => {
-                        let socket = TcpStream::connect(&options.service).await.unwrap();
-                        let (in_send, in_recv) = tokio::sync::mpsc::channel(16);
-                        connections.insert(stream, in_send);
+                        if let Some(conn) = connections.get_mut(&stream) {
+                            conn.send(Payload::Establish { sender }).await.unwrap();
+                        } else {
+                            let socket = TcpStream::connect(&options.service).await.unwrap();
+                            let (in_send, in_recv) = tokio::sync::mpsc::channel(16);
+                            connections.insert(stream, in_send);
 
-                        tokio::spawn(reliable_transport(sender, stream, socket, out_send.clone(), in_recv));
+                            out_send.send(Packet {
+                                recipient: sender,
+                                stream,
+                                payload: Payload::Ack { idx: 0 }
+                            }).await.unwrap();
+
+                            tokio::spawn(reliable_transport(sender, stream, socket, out_send.clone(), in_recv, None));
+                        }
                     },
                     other => {
-                        if let Some(mut in_send) = connections.get_mut(&stream) {
-                            in_send.send(other)
-                                .await
-                                .map_err(|_| "send_err")
-                                .unwrap();
+                        let mut was_err = false;
+                        if let Some(in_send) = connections.get_mut(&stream) {
+                            if in_send.send(other).await.is_err() {
+                                was_err = true;
+                            }
+                        }
+                        if was_err {
+                            connections.remove(&stream);
                         }
                     }
                 }

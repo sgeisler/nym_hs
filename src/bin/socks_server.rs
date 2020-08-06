@@ -19,6 +19,8 @@ struct Options {
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt::init();
+
     let connections: Connections = Default::default();
     let (out_sender, out_receiver) = tokio::sync::mpsc::channel(16);
 
@@ -67,7 +69,21 @@ async fn handle_connection(
         .gateway
         .copy_from_slice(&bs58::decode(gateway).into_vec().unwrap());
 
-    reliable_transport(recipient, id, socket, out, incoming).await
+    reliable_transport(
+        recipient,
+        id,
+        socket,
+        out,
+        incoming,
+        Some(Packet {
+            recipient,
+            stream: id,
+            payload: Payload::Establish {
+                sender: Default::default(),
+            },
+        }),
+    )
+    .await
 }
 
 async fn nym_client(connections: Connections, mut outgoing: Receiver<Packet>) {
@@ -114,14 +130,17 @@ async fn nym_client(connections: Connections, mut outgoing: Receiver<Packet>) {
             },
             Some(Ok(message)) = ws.next() => {
                 let (stream, payload) = message_to_stream_payload(message);
-                connections.write()
-                    .await
-                    .get_mut(&stream)
-                    .unwrap()
-                    .send(payload)
-                    .await
-                    .map_err(|_| "send_err")
-                    .unwrap();
+                let mut conn_lock = connections.write()
+                    .await;
+                let mut was_err = false;
+                if let Some(ref mut client) = conn_lock.get_mut(&stream) {
+                    was_err = client.send(payload)
+                        .await
+                        .is_err();
+                }
+                if was_err {
+                    conn_lock.remove(&stream);
+                }
             }
         }
     }
