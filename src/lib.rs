@@ -1,5 +1,8 @@
+use bech32::{CheckBase32, FromBase32, ToBase32};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt::Display;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -36,6 +39,45 @@ pub enum Payload {
 pub struct Identity {
     pub client: [u8; 32],
     pub gateway: [u8; 32],
+}
+
+impl Display for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut bytes = [0u8; 64];
+        bytes[..32].copy_from_slice(&self.client);
+        bytes[32..].copy_from_slice(&self.gateway);
+        bech32::encode_to_fmt(f, "nym", &(&bytes[..]).to_base32()).unwrap()
+    }
+}
+
+#[derive(Debug)]
+pub enum IdentityParseError {
+    WrongLenght(usize),
+    InvalidBech32(bech32::Error),
+    InvalidHRP(String),
+}
+
+impl FromStr for Identity {
+    type Err = IdentityParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (hrp, data) = bech32::decode(s).map_err(|e| IdentityParseError::InvalidBech32(e))?;
+        let bytes = Vec::<u8>::from_base32(&data).unwrap();
+
+        if hrp != "nym" {
+            return Err(IdentityParseError::InvalidHRP(hrp));
+        }
+
+        if bytes.len() != 64 {
+            return Err(IdentityParseError::WrongLenght(bytes.len()));
+        }
+
+        let mut identity = Identity::default();
+        identity.client.copy_from_slice(&bytes[..32]);
+        identity.gateway.copy_from_slice(&bytes[32..]);
+
+        Ok(identity)
+    }
 }
 
 pub async fn reliable_transport(

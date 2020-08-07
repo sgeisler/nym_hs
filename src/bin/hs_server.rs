@@ -35,7 +35,6 @@ async fn main() {
     ))
     .unwrap();
     let addr = addr_answer.get("address").unwrap().as_str().unwrap();
-    println!("Listening: {}", addr);
     let mut addr_parts = addr.split('@');
     let node = bs58::decode(&addr_parts.next().unwrap())
         .into_vec()
@@ -47,6 +46,8 @@ async fn main() {
     let mut us = Identity::default();
     us.client.copy_from_slice(&node);
     us.gateway.copy_from_slice(&gateway);
+
+    println!("Listening: {}.nym", us);
 
     let (mut out_send, mut out_rec) = tokio::sync::mpsc::channel(16);
     let mut connections = HashMap::<ConnectionId, Sender<Payload>>::new();

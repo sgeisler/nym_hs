@@ -56,22 +56,16 @@ async fn handle_connection(
 
     // parse <nym_id>.nym TLDs
     let mut fqdn = req.fqdn.split('.');
-    let peer = fqdn.next().ok_or(SocksError::UnsupportedDestination)?;
-    let gateway = fqdn.next().ok_or(SocksError::UnsupportedDestination)?;
+    let recipient_str = fqdn.next().ok_or(SocksError::UnsupportedDestination)?;
     if "nym" != fqdn.next().ok_or(SocksError::UnsupportedDestination)? {
         return Err(SocksError::UnsupportedDestination);
     }
-    // assert_eq!("nym", fqdn.next().unwrap());
-    // assert_eq!(None, fqdn.next());
-
-    let mut recipient = Identity::default();
-    recipient
-        .client
-        .copy_from_slice(&bs58::decode(peer).into_vec().unwrap());
-    recipient
-        .gateway
-        .copy_from_slice(&bs58::decode(gateway).into_vec().unwrap());
-
+    if fqdn.next().is_some() {
+        return Err(SocksError::UnsupportedDestination);
+    }
+    let recipient = recipient_str
+        .parse()
+        .map_err(|_| SocksError::UnsupportedDestination)?;
     reliable_transport(
         recipient,
         id,
@@ -205,7 +199,7 @@ async fn receive_request(socket: &mut TcpStream) -> Result<SocksRequest, SocksEr
         tokio_byteorder::AsyncReadBytesExt::read_u16::<tokio_byteorder::BigEndian>(socket).await?;
     // Our response is kinda bs except that it says it was successful (which might actually be the case)
     socket.write_all(&[5, 0, 0, 1, 10, 0, 0, 1]).await?;
-    //tokio_byteorder::AsyncWriteBytesExt::write_u16::<tokio_byteorder::BigEndian>(socket, port)
-    //    .await?;
+    tokio_byteorder::AsyncWriteBytesExt::write_u16::<tokio_byteorder::BigEndian>(socket, port)
+        .await?;
     Ok(SocksRequest { fqdn: addr, port })
 }
