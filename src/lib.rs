@@ -8,6 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::select;
 use tokio::stream::StreamExt;
+use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::RwLock;
 use tokio::time::Duration;
@@ -15,7 +16,7 @@ use tracing::{debug, info, trace, warn};
 use tungstenite::Message;
 
 // how long to wait for acks before resending in ms
-pub const TIMEOUT: u64 = 5000;
+pub const TIMEOUT: u64 = 2000;
 
 pub type ConnectionId = [u8; 32];
 /// Maps connection id to a socket reachable through a channel
@@ -99,7 +100,7 @@ pub async fn reliable_transport(
     loop {
         select! {
             read = socket.read(&mut buffer), if unack_msg.is_none() => {
-                let read = read.unwrap();
+                let read = read?;
                 trace!("received bytes from socket {:?}", &buffer[..read]);
                 last_out_msg_id += 1;
                 let packet = Packet {
@@ -111,10 +112,7 @@ pub async fn reliable_transport(
                     },
                 };
                 unack_msg = Some(packet.clone());
-                egress.send(packet)
-                    .await
-                    .map_err(|_| "send_error")
-                    .unwrap();
+                egress.send(packet).await?;
             },
             Some(payload) = ingress.next() => {
                 trace!("received payload from nym {:?}", payload);
@@ -130,13 +128,11 @@ pub async fn reliable_transport(
                                     idx
                                 }
                             })
-                                .await
-                                .map_err(|_| "send_error")
-                                .unwrap();
+                                .await?;
                         } else if last_in_msg_id + 1 == idx {
                             // accept data and send ACK
                             trace!("received data {:?} and sending ACK {}", data, idx);
-                            socket.write_all(&data).await.unwrap();
+                            socket.write_all(&data).await?;
                             last_in_msg_id = idx;
                             egress.send(Packet {
                                 recipient: peer,
@@ -145,11 +141,9 @@ pub async fn reliable_transport(
                                     idx
                                 }
                             })
-                                .await
-                                .map_err(|_| "send_error")
-                                .unwrap();
+                                .await?;
                         } else {
-                            panic!("invalid state");
+                            warn!("Invalid state: unexpected ACK");
                         }
                     },
                     Payload::Ack { idx } => {
@@ -169,50 +163,43 @@ pub async fn reliable_transport(
                                     idx: 0
                                 }
                             })
-                                .await
-                                .map_err(|_| "send_error")
-                                .unwrap();
+                                .await?;
                     },
                 }
             },
             _ = resend_interval.tick() => {
                 if let Some(packet) = unack_msg.clone() {
                     trace!("resending packet");
-                    egress.send(packet)
-                        .await
-                        .map_err(|_| "send_error")
-                        .unwrap();
+                    egress.send(packet).await?;
                 }
             }
         }
     }
 }
 
-pub fn message_to_string(msg: Message) -> String {
+pub fn message_to_string(msg: Message) -> Result<String, SocksError> {
     match msg {
-        Message::Text(command) => command,
-        Message::Binary(bin) => String::from_utf8(bin).unwrap(),
-        Message::Close(_) => {
-            panic!("Connection closed");
+        Message::Text(command) => Ok(command),
+        Message::Binary(bin) => {
+            String::from_utf8(bin).map_err(|_| SocksError::ProtocolError("invalid UTF8"))
         }
-        msg => {
-            panic!("Received unsupported message: {:?}", msg);
-        }
+        _ => Err(SocksError::ProtocolError("unexpected message")),
     }
 }
 
-pub fn message_to_stream_payload(msg: Message) -> (ConnectionId, Payload) {
+pub fn message_to_stream_payload(msg: Message) -> Result<(ConnectionId, Payload), SocksError> {
     let bytes = match msg {
         Message::Binary(bin) => bin,
-        _ => panic!("Unexpected msg type"),
+        _ => return Err(SocksError::ProtocolError("unexpected message")),
     };
 
     let mut id = ConnectionId::default();
     id.copy_from_slice(&bytes[0..32]);
 
-    let payload = bincode::deserialize::<Payload>(&bytes[32..]).unwrap();
+    let payload = bincode::deserialize::<Payload>(&bytes[32..])
+        .map_err(|_| SocksError::ProtocolError("Decoding Error"))?;
 
-    (id, payload)
+    Ok((id, payload))
 }
 
 #[derive(Debug)]
@@ -220,10 +207,17 @@ pub enum SocksError {
     UnsupportedDestination,
     IoError(tokio::io::Error),
     ProtocolError(&'static str),
+    ConnectionDropped,
 }
 
 impl From<tokio::io::Error> for SocksError {
     fn from(e: tokio::io::Error) -> Self {
         SocksError::IoError(e)
+    }
+}
+
+impl<T> From<SendError<T>> for SocksError {
+    fn from(e: SendError<T>) -> Self {
+        SocksError::ConnectionDropped
     }
 }

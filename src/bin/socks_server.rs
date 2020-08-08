@@ -10,6 +10,7 @@ use tokio::prelude::*;
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_tungstenite::connect_async;
+use tracing::{debug, warn};
 use tungstenite::Message;
 
 #[derive(StructOpt)]
@@ -66,7 +67,7 @@ async fn handle_connection(
     let recipient = recipient_str
         .parse()
         .map_err(|_| SocksError::UnsupportedDestination)?;
-    reliable_transport(
+    let res = reliable_transport(
         recipient,
         id,
         socket,
@@ -80,7 +81,10 @@ async fn handle_connection(
             },
         }),
     )
-    .await
+    .await;
+    connections.write().await.remove(&id);
+    debug!("Closed connection with result {:?}", res);
+    res
 }
 
 async fn nym_client(connections: Connections, mut outgoing: Receiver<Packet>) {
@@ -94,9 +98,9 @@ async fn nym_client(connections: Connections, mut outgoing: Receiver<Packet>) {
         .await
         .unwrap();
 
-    let addr_answer = serde_json::from_str::<serde_json::Value>(&message_to_string(
-        ws.next().await.unwrap().unwrap(),
-    ))
+    let addr_answer = serde_json::from_str::<serde_json::Value>(
+        &message_to_string(ws.next().await.unwrap().unwrap()).unwrap(),
+    )
     .unwrap();
     let addr = addr_answer.get("address").unwrap().as_str().unwrap();
     let mut addr_parts = addr.split('@');
@@ -126,17 +130,20 @@ async fn nym_client(connections: Connections, mut outgoing: Receiver<Packet>) {
                 ws.next().await.unwrap().unwrap();
             },
             Some(Ok(message)) = ws.next() => {
-                let (stream, payload) = message_to_stream_payload(message);
-                let mut conn_lock = connections.write()
-                    .await;
-                let mut was_err = false;
-                if let Some(ref mut client) = conn_lock.get_mut(&stream) {
-                    was_err = client.send(payload)
-                        .await
-                        .is_err();
-                }
-                if was_err {
-                    conn_lock.remove(&stream);
+                if let Ok((stream, payload)) = message_to_stream_payload(message) {
+                    let mut conn_lock = connections.write()
+                        .await;
+                    let mut was_err = false;
+                    if let Some(ref mut client) = conn_lock.get_mut(&stream) {
+                        was_err = client.send(payload)
+                            .await
+                            .is_err();
+                    }
+                    if was_err {
+                        conn_lock.remove(&stream);
+                    }
+                } else {
+                    warn!("Received invalid message!");
                 }
             }
         }

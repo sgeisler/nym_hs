@@ -8,6 +8,7 @@ use tokio::select;
 use tokio::stream::StreamExt;
 use tokio::sync::mpsc::Sender;
 use tokio_tungstenite::connect_async;
+use tracing::warn;
 use tungstenite::Message;
 
 #[derive(StructOpt)]
@@ -30,9 +31,9 @@ async fn main() {
         .await
         .unwrap();
 
-    let addr_answer = serde_json::from_str::<serde_json::Value>(&message_to_string(
-        ws.next().await.unwrap().unwrap(),
-    ))
+    let addr_answer = serde_json::from_str::<serde_json::Value>(
+        &message_to_string(ws.next().await.unwrap().unwrap()).unwrap(),
+    )
     .unwrap();
     let addr = addr_answer.get("address").unwrap().as_str().unwrap();
     let mut addr_parts = addr.split('@');
@@ -61,37 +62,40 @@ async fn main() {
                 ws.next().await.unwrap().unwrap();
             },
             Some(Ok(message)) = ws.next() => {
-                let (stream, payload) = message_to_stream_payload(message);
-                match payload {
-                    Payload::Establish { sender } => {
-                    // FIXME: turn match/if around
-                        if let Some(conn) = connections.get_mut(&stream) {
-                            conn.send(Payload::Establish { sender }).await.unwrap();
-                        } else {
-                            let socket = TcpStream::connect(&options.service).await.unwrap();
-                            let (in_send, in_recv) = tokio::sync::mpsc::channel(16);
-                            connections.insert(stream, in_send);
+                if let Ok((stream, payload)) = message_to_stream_payload(message) {
+                    match payload {
+                        Payload::Establish { sender } => {
+                        // FIXME: turn match/if around
+                            if let Some(conn) = connections.get_mut(&stream) {
+                                conn.send(Payload::Establish { sender }).await.unwrap();
+                            } else {
+                                let socket = TcpStream::connect(&options.service).await.unwrap();
+                                let (in_send, in_recv) = tokio::sync::mpsc::channel(16);
+                                connections.insert(stream, in_send);
 
-                            out_send.send(Packet {
-                                recipient: sender,
-                                stream,
-                                payload: Payload::Ack { idx: 0 }
-                            }).await.unwrap();
+                                out_send.send(Packet {
+                                    recipient: sender,
+                                    stream,
+                                    payload: Payload::Ack { idx: 0 }
+                                }).await.unwrap();
 
-                            tokio::spawn(reliable_transport(sender, stream, socket, out_send.clone(), in_recv, None));
-                        }
-                    },
-                    other => {
-                        let mut was_err = false;
-                        if let Some(in_send) = connections.get_mut(&stream) {
-                            if in_send.send(other).await.is_err() {
-                                was_err = true;
+                                tokio::spawn(reliable_transport(sender, stream, socket, out_send.clone(), in_recv, None));
+                            }
+                        },
+                        other => {
+                            let mut was_err = false;
+                            if let Some(in_send) = connections.get_mut(&stream) {
+                                if in_send.send(other).await.is_err() {
+                                    was_err = true;
+                                }
+                            }
+                            if was_err {
+                                connections.remove(&stream);
                             }
                         }
-                        if was_err {
-                            connections.remove(&stream);
-                        }
                     }
+                } else {
+                    warn!("Receied invalid Message!");
                 }
             }
         }
