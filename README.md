@@ -1,3 +1,5 @@
+# Do not use this! It's based on a faulty assumption about the privacy Nym provides! It needs features from 0.8 to fix it, which isn't released yet.
+
 # Nym Hidden Service Protocol
 
 **This software ist pre-alpha and crashes a lot. The first connection works normally though. I'm slowly addressing all
